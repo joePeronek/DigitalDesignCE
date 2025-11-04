@@ -1,0 +1,22 @@
+# PlatformIO build folders
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# clangd cache
+.cache/
+.clangd/
+
+# Mac/Linux system files
+.DS_Store
+Thumbs.db
+
+# Logs / temp files
+*.log
+*.tmp
+*.swp
+
+# Binary builds
+*.bin
+*.elf
+*.hex
