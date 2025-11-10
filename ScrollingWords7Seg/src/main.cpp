@@ -37,6 +37,16 @@ unsigned long gLastScrollMillis = 0;
 char gSerialInputBuffer[kMaxMessageLength + 1] = {};
 size_t gSerialInputLength = 0;
 bool gIgnoreNextLinefeed = false;
+int gScrollDirection = 1; // 1: right-to-left, -1: left-to-right
+enum class PingPongState : uint8_t { None, AwaitingBounce };
+
+PingPongState gPingPongState = PingPongState::None;
+constexpr char kPingCommand[] = "PING";
+constexpr char kPongResponse[] = "PONG";
+constexpr size_t kPingCommandLength = sizeof(kPingCommand) - 1;
+constexpr size_t kPongResponseLength = sizeof(kPongResponse) - 1;
+
+void setMessage(const char *message, size_t length);
 
 constexpr uint8_t SEG_A = 1 << 0;
 constexpr uint8_t SEG_B = 1 << 1;
@@ -193,12 +203,89 @@ void buildPaddedMessage() {
   }
 }
 
+bool windowHasVisibleChars(size_t index) {
+  if (index >= gPaddedLength) {
+    return false;
+  }
+
+  for (size_t digit = 0; digit < kDisplayDigits; ++digit) {
+    const size_t charIndex = index + digit;
+    if (charIndex >= gPaddedLength) {
+      break;
+    }
+    if (gPaddedMessage[charIndex] != ' ') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool handlePingPongBounce() {
+  if (gPingPongState != PingPongState::AwaitingBounce) {
+    return false;
+  }
+
+  if (gScrollLimit <= 1) {
+    gPingPongState = PingPongState::None;
+    return false;
+  }
+
+  if (!windowHasVisibleChars(gScrollIndex)) {
+    return false;
+  }
+
+  bool nextWindowHasChars = false;
+  if (gScrollDirection >= 0) {
+    if ((gScrollIndex + 1) < gScrollLimit) {
+      nextWindowHasChars = windowHasVisibleChars(gScrollIndex + 1);
+    }
+  } else {
+    if (gScrollIndex > 0) {
+      nextWindowHasChars = windowHasVisibleChars(gScrollIndex - 1);
+    }
+  }
+
+  if (nextWindowHasChars) {
+    return false;
+  }
+
+  gScrollDirection = (gScrollDirection >= 0) ? -1 : 1;
+  gPingPongState = PingPongState::None;
+
+  setMessage(kPongResponse, kPongResponseLength);
+
+  if (gScrollLimit > 0) {
+    if (gScrollDirection >= 0) {
+      const size_t maxIndex = gScrollLimit - 1;
+      gScrollIndex = (maxIndex >= 1) ? 1 : maxIndex;
+    } else {
+      gScrollIndex = (gScrollLimit > 2) ? (gScrollLimit - 2) : 0;
+    }
+    updateScrollBuffer();
+  }
+
+  return true;
+}
+
 void advanceScroll() {
   if (gScrollLimit <= 1) {
     return;
   }
 
-  gScrollIndex = (gScrollIndex + 1) % gScrollLimit;
+  if (handlePingPongBounce()) {
+    return;
+  }
+
+  if (gScrollDirection >= 0) {
+    gScrollIndex = (gScrollIndex + 1) % gScrollLimit;
+  } else {
+    if (gScrollIndex == 0) {
+      gScrollIndex = gScrollLimit - 1;
+    } else {
+      --gScrollIndex;
+    }
+  }
   updateScrollBuffer();
 }
 
@@ -219,13 +306,82 @@ void setMessage(const char *message, size_t length) {
 
   gScrollIndex = 0;
   buildPaddedMessage();
+  if (gScrollDirection < 0 && gScrollLimit > 0) {
+    gScrollIndex = gScrollLimit - 1;
+  }
   updateScrollBuffer();
   gLastScrollMillis = millis();
 }
 
+void updateScrollDirectionFromMessage(const char *message, size_t length) {
+  while (length > 0) {
+    const char c = message[length - 1];
+    if (c == '9') {
+      gScrollDirection = 1;
+      break;
+    }
+    if (c == '0') {
+      gScrollDirection = -1;
+      break;
+    }
+    if (!isspace(static_cast<unsigned char>(c))) {
+      break;
+    }
+    --length;
+  }
+}
+
+bool isPingCommand(const char *message, size_t length) {
+  size_t start = 0;
+  while (start < length &&
+         isspace(static_cast<unsigned char>(message[start]))) {
+    ++start;
+  }
+
+  if (start >= length) {
+    return false;
+  }
+
+  size_t end = length;
+  while (end > start &&
+         isspace(static_cast<unsigned char>(message[end - 1]))) {
+    --end;
+  }
+
+  size_t trimmedEnd = end;
+  if (trimmedEnd > start) {
+    const char lastChar = message[trimmedEnd - 1];
+    if (lastChar == '0' || lastChar == '9') {
+      --trimmedEnd;
+      while (trimmedEnd > start &&
+             isspace(static_cast<unsigned char>(message[trimmedEnd - 1]))) {
+        --trimmedEnd;
+      }
+    }
+  }
+
+  const size_t trimmedLength = (trimmedEnd > start) ? (trimmedEnd - start) : 0;
+  if (trimmedLength != kPingCommandLength) {
+    return false;
+  }
+
+  for (size_t i = 0; i < kPingCommandLength; ++i) {
+    const char c = message[start + i];
+    if (toupper(static_cast<unsigned char>(c)) != kPingCommand[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 void commitSerialMessage() {
   gSerialInputBuffer[gSerialInputLength] = '\0';
+  const bool isPing = isPingCommand(gSerialInputBuffer, gSerialInputLength);
+  updateScrollDirectionFromMessage(gSerialInputBuffer, gSerialInputLength);
   setMessage(gSerialInputBuffer, gSerialInputLength);
+  gPingPongState =
+      isPing ? PingPongState::AwaitingBounce : PingPongState::None;
   gSerialInputLength = 0;
 
   Serial.print(F("Scrolling: "));
